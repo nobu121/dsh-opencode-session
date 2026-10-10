@@ -35,17 +35,33 @@ function fakeCtx() {
       return () => cleanup?.()
     },
     cleanups: [],
-    on(name, listener) {
+    on(name, listener, options) {
       if (!listeners.has(name)) listeners.set(name, [])
-      listeners.get(name).push(listener)
+      const list = listeners.get(name)
+      // Cordis `prepend` unshifts, so the most recently prepended listener is
+      // the outermost one in a waterfall.
+      if (options?.prepend) list.unshift(listener)
+      else list.push(listener)
       return () => {
-        const list = listeners.get(name) ?? []
         const i = list.indexOf(listener)
         if (i >= 0) list.splice(i, 1)
       }
     },
   }
   return ctx
+}
+
+// Cordis waterfall dispatch: the last argument is the innermost `next`, and
+// each listener receives the shared arguments plus its own `next`.
+function waterfall(ctx, name, ...args) {
+  const listeners = [...(ctx.listeners.get(name) ?? [])]
+  const inner = args.pop()
+  const next = () => {
+    const listener = listeners.shift() ?? inner
+    return listener(...args)
+  }
+  args.push(next)
+  return next()
 }
 
 // The plugin rewrites globalThis.fetch on apply and restores on cleanup, so
@@ -236,6 +252,58 @@ try {
       assert.equal(b2.value.echoed.headers['x-opencode-session'], 'session-conv-b')
     })
     for (const cleanup of ctx4.cleanups) cleanup()
+    assert.equal(globalThis.fetch, realFetch)
+  }
+
+  // 10) An auxiliary call that omits `sessionId` still receives the header
+  // while it runs inside a `tools/pre-execute` call — the experimental
+  // auto-review gate builds its reviewer request that way.
+  {
+    const ctx5 = fakeCtx()
+    plugin.apply(ctx5, { providers: ['opencode-go'], mode: 'session-id' })
+    const listener5 = ctx5.listeners.get('llm/stream')[0]
+
+    let reviewerHeader
+    let bareHeader
+    const gate = async (exec, next) => {
+      // Reviewer request: no sessionId, exactly like a hand-built gate.
+      const chunks = []
+      for await (const chunk of listener5({ provider: 'opencode-go', model: 'm' }, () => adapterStream('reviewer'))) {
+        chunks.push(chunk)
+      }
+      reviewerHeader = chunks[0].echoed.headers['x-opencode-session']
+      // A request the tool body itself makes in the same window stays clean.
+      const bare = await fetch(`${url}/v1/models`)
+      bareHeader = (await bare.json()).headers['x-opencode-session']
+      return next()
+    }
+    // Registered BEFORE the plugin installs its own gate listener, so the
+    // plugin's later registration must still win the waterfall.
+    ctx5.on('tools/pre-execute', gate, { prepend: true })
+
+    // The first stream is what installs the session scope.
+    for await (const _ of listener5(
+      { provider: 'opencode-go', sessionId: 'session-tool-1', model: 'm' },
+      () => adapterStream('main'),
+    )) { /* drain */ }
+
+    const decision = await waterfall(ctx5, 'tools/pre-execute',
+      { name: 'bash', agent: { session: { id: 'session-tool-1' } } },
+      () => Promise.resolve({ kind: 'allow' }))
+
+    check('auxiliary call inside a tool execution reuses the wrapping session', () => {
+      assert.equal(reviewerHeader, 'session-tool-1')
+    })
+    check('tool body request inside the same execution stays untouched', () => {
+      assert.equal(bareHeader, undefined)
+    })
+    check('plugin gate listener runs ahead of an earlier prepended listener', () => {
+      assert.notEqual(ctx5.listeners.get('tools/pre-execute')[0], gate)
+      assert.equal(ctx5.listeners.get('tools/pre-execute')[1], gate)
+      assert.deepEqual(decision, { kind: 'allow' })
+    })
+
+    for (const cleanup of ctx5.cleanups) cleanup()
     assert.equal(globalThis.fetch, realFetch)
   }
 } finally {

@@ -87,17 +87,26 @@ whole `config`, so restate every key).
 ## How it works
 
 1. Listens on the `llm/stream` waterfall. A call whose `options.provider`
-   names a configured OpenCode route and which carries a `sessionId` is
-   driven through an `AsyncLocalStorage` store holding the header value.
+   names a configured OpenCode route is driven through an `AsyncLocalStorage`
+   store holding the header value when it either carries a `sessionId` or runs
+   inside a tool execution that names the session (item 4).
 2. `globalThis.fetch` is patched once. While such a store is active, the
    outgoing request receives `x-opencode-session: <value>` (unless it already
    carries the header — an existing value always wins).
-3. Both registrations are fiber-scoped ctx effects: stopping / updating /
+3. All registrations are fiber-scoped ctx effects: stopping / updating /
    unloading the plugin restores the original `fetch` and removes the
-   listener.
+   listeners.
+4. Auxiliary calls that omit `sessionId` — some plugins build their model
+   requests by hand — are covered while they run inside a `tools/pre-execute`
+   call: that listener runs the rest of the waterfall inside a session store,
+   so for example the reviewer request of the experimental auto-review gate
+   keeps its conversation's header. Only the `llm/stream` listener reads that
+   store, so a tool body's own requests are never touched. The listener is
+   registered on the first `llm/stream` so it always runs ahead of a gate that
+   registered its own `tools/pre-execute` listener earlier.
 
-Non-OpenCode providers, requests without a `sessionId` (some auxiliary
-hand-built calls), and model discovery requests pass through untouched.
+Non-OpenCode providers, model discovery requests, and a request that neither
+carries a `sessionId` nor runs inside a tool execution pass through untouched.
 
 ## Notes / limitations
 
